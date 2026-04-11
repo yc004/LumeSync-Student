@@ -2,10 +2,9 @@
   "name": "@lumesync/student",
   "version": "1.0.0",
   "description": "SyncClassroom Student App",
-  "main": "electron/main.js",
   "scripts": {
-    "start": "electron .",
-    "build": "electron-builder --config electron-builder.json",
+    "start": "node scripts/start-native.js",
+    "build": "npm run build:student-native",
     "build:host-ui": "node ui/student-host/scripts/build.mjs",
     "build:native:configure": "cmake -S . -B build/native-vs -G \"Visual Studio 17 2022\" -A x64",
     "build:native": "cmake --build build/native-vs --config Release",
@@ -20,8 +19,6 @@
     "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
-    "electron": "29.4.6",
-    "electron-builder": "^24.13.3",
     "typescript": "^5.8.3"
   },
   "keywords": [

@@ -43,7 +43,7 @@ foreach ($Candidate in $MakensisCandidates) {
 }
 
 if (-not $Makensis) {
-  throw "NSIS makensis.exe was not found. Install NSIS or run electron-builder once to populate its NSIS cache."
+  throw "NSIS makensis.exe was not found. Install NSIS or place makensis.exe in PATH."
 }
 
 $Args = @(
