@@ -1,0 +1,1222 @@
+#include <windows.h>
+#include <shellapi.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "lumesync/shared.h"
+#include "resource.h"
+
+#if __has_include(<WebView2.h>)
+#define LUMESYNC_HAS_WEBVIEW2 1
+#include <WebView2.h>
+#include <WebView2EnvironmentOptions.h>
+#include <wrl.h>
+using Microsoft::WRL::Callback;
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Make;
+#else
+#define LUMESYNC_HAS_WEBVIEW2 0
+#endif
+
+namespace {
+
+constexpr UINT WM_TRAY_ICON = WM_APP + 40;
+constexpr UINT_PTR kRetryTimerId = 1;
+constexpr UINT_PTR kHeartbeatTimerId = 2;
+constexpr UINT_PTR kFocusTimerId = 3;
+constexpr UINT kTrayAdmin = 1001;
+constexpr UINT kTrayShow = 1002;
+constexpr UINT kTrayExit = 1003;
+constexpr UINT kAdminLoginPassword = 2001;
+constexpr UINT kAdminLoginSubmit = 2002;
+constexpr UINT kAdminIp = 2010;
+constexpr UINT kAdminPort = 2011;
+constexpr UINT kAdminAutostart = 2012;
+constexpr UINT kAdminNewPassword = 2013;
+constexpr UINT kAdminConfirmPassword = 2014;
+constexpr UINT kAdminSave = 2015;
+constexpr UINT kAdminClose = 2016;
+constexpr UINT kAdminBack = 2017;
+
+class StudentShellApp;
+StudentShellApp* g_app = nullptr;
+constexpr wchar_t kMainWindowClassName[] = L"LumeSyncStudentShellWindow";
+constexpr wchar_t kAdminWindowClassName[] = L"LumeSyncStudentAdminWindow";
+constexpr wchar_t kMainInstanceMutex[] = L"Global\\LumeSyncStudentShell.Main";
+constexpr wchar_t kAdminInstanceMutex[] = L"Global\\LumeSyncStudentShell.Admin";
+
+std::filesystem::path ExePath() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+  while (length == buffer.size()) {
+    buffer.resize(buffer.size() * 2);
+    length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+  }
+  buffer.resize(length);
+  return buffer;
+}
+
+std::filesystem::path ExeDir() {
+  return ExePath().parent_path();
+}
+
+bool HasArg(const std::wstring& wanted) {
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (!argv) return false;
+
+  bool found = false;
+  for (int i = 1; i < argc; ++i) {
+    if (wanted == argv[i]) {
+      found = true;
+      break;
+    }
+  }
+
+  LocalFree(argv);
+  return found;
+}
+
+bool ActivateExistingInstance(bool adminMode) {
+  HWND existing = FindWindowW(adminMode ? kAdminWindowClassName : kMainWindowClassName, nullptr);
+  if (!existing) {
+    return false;
+  }
+
+  ShowWindow(existing, SW_RESTORE);
+  SetForegroundWindow(existing);
+  return true;
+}
+
+HANDLE AcquireInstanceMutex(bool adminMode) {
+  const wchar_t* mutexName = adminMode ? kAdminInstanceMutex : kMainInstanceMutex;
+  HANDLE mutex = CreateMutexW(nullptr, TRUE, mutexName);
+  if (!mutex) {
+    return nullptr;
+  }
+
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(mutex);
+    return nullptr;
+  }
+
+  return mutex;
+}
+
+void EnableDpiAwareness() {
+  if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+    SetProcessDPIAware();
+  }
+}
+
+std::wstring QuotePath(const std::filesystem::path& path) {
+  return L"\"" + path.wstring() + L"\"";
+}
+
+std::wstring ToFileUrl(const std::filesystem::path& path) {
+  std::wstring value = std::filesystem::absolute(path).wstring();
+  std::replace(value.begin(), value.end(), L'\\', L'/');
+  if (value.rfind(L"//", 0) == 0) {
+    return L"file:" + value;
+  }
+  return L"file:///" + value;
+}
+
+RECT CenteredWindowRect(int width, int height) {
+  RECT workArea = {};
+  SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+  const int availableWidth = workArea.right - workArea.left;
+  const int availableHeight = workArea.bottom - workArea.top;
+  const int x = workArea.left + max(0, (availableWidth - width) / 2);
+  const int y = workArea.top + max(0, (availableHeight - height) / 2);
+  return RECT{x, y, x + width, y + height};
+}
+
+RECT DefaultShellWindowRect() {
+  RECT workArea = {};
+  SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+  const int availableWidth = workArea.right - workArea.left;
+  const int availableHeight = workArea.bottom - workArea.top;
+  const int width = min(max(1440, availableWidth * 85 / 100), availableWidth);
+  const int height = min(max(900, availableHeight * 85 / 100), availableHeight);
+  return CenteredWindowRect(width, height);
+}
+
+std::optional<std::filesystem::path> FindUiAsset(const std::wstring& fileName) {
+  const std::vector<std::filesystem::path> candidates = {
+      ExeDir() / L"ui" / L"student-host" / L"dist" / fileName,
+      ExeDir() / L"resources" / L"ui" / L"student-host" / L"dist" / fileName,
+      std::filesystem::current_path() / L"ui" / L"student-host" / L"dist" / fileName,
+      std::filesystem::current_path().parent_path() / L"ui" / L"student-host" / L"dist" / fileName,
+  };
+
+  for (const auto& candidate : candidates) {
+    if (std::filesystem::exists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return std::nullopt;
+}
+
+std::wstring BuildWebView2BrowserArguments(const lumesync::StudentConfig& config) {
+  const int port = config.port > 0 ? config.port : 3000;
+  std::wostringstream secureOrigins;
+  secureOrigins << L"http://" << config.teacherIp << L":" << port
+                << L",http://localhost:" << port
+                << L",http://127.0.0.1:" << port;
+
+  std::wostringstream args;
+  args << L"--use-fake-ui-for-media-stream "
+       << L"--unsafely-treat-insecure-origin-as-secure=" << secureOrigins.str();
+  return args.str();
+}
+
+void ShowTaskbar(bool show) {
+  if (HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr)) {
+    ShowWindow(taskbar, show ? SW_SHOW : SW_HIDE);
+  }
+  if (HWND secondaryTaskbar = FindWindowW(L"Shell_SecondaryTrayWnd", nullptr)) {
+    ShowWindow(secondaryTaskbar, show ? SW_SHOW : SW_HIDE);
+  }
+}
+
+std::wstring HostApiScript() {
+  return LR"JS(
+(() => {
+  if (!window.chrome?.webview || window.studentHost?.__native) return;
+  function hideScrollbars() {
+    if (document.getElementById("lumesync-hide-scrollbars")) return;
+    const style = document.createElement("style");
+    style.id = "lumesync-hide-scrollbars";
+    style.textContent = `
+      html, body {
+        scrollbar-width: none !important;
+        -ms-overflow-style: none !important;
+        user-select: none !important;
+        -webkit-user-select: none !important;
+      }
+      * {
+        user-select: none !important;
+        -webkit-user-select: none !important;
+        -webkit-user-drag: none !important;
+      }
+      html::-webkit-scrollbar, body::-webkit-scrollbar, *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", hideScrollbars, { once: true });
+  } else {
+    hideScrollbars();
+  }
+  document.addEventListener("selectstart", (event) => event.preventDefault(), true);
+  document.addEventListener("dragstart", (event) => event.preventDefault(), true);
+  let nextId = 1;
+  const pending = new Map();
+  function rpc(action, payload) {
+    const id = `rpc-${Date.now()}-${nextId++}`;
+    window.chrome.webview.postMessage({ kind: "rpc", id, action, payload: payload ?? {} });
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      window.setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        reject(new Error(`Native RPC timed out: ${action}`));
+      }, 10000);
+    });
+  }
+  function send(action, payload) {
+    window.chrome.webview.postMessage({ kind: "event", action, payload: payload ?? {} });
+  }
+  window.chrome.webview.addEventListener("message", (event) => {
+    const message = event.data || {};
+    if (message.kind !== "rpc-result" || !pending.has(message.id)) return;
+    const pendingCall = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.ok === false) pendingCall.reject(new Error(message.error || "Native RPC failed"));
+    else pendingCall.resolve(message.payload);
+  });
+  const api = {
+    __native: true,
+    classStarted: (options) => send("classStarted", options || {}),
+    classEnded: () => send("classEnded"),
+    setFullscreen: (enable) => send("setFullscreen", { enable: !!enable }),
+    manualRetry: () => send("manualRetry"),
+    setAdminPassword: (hash) => send("setAdminPassword", { hash }),
+    toggleDevTools: () => send("toggleDevTools"),
+    getConfig: () => rpc("getConfig"),
+    saveConfig: (config) => rpc("saveConfig", config || {}),
+    verifyPassword: (password) => rpc("verifyPassword", { password }),
+    getAutostart: () => rpc("getAutostart"),
+    setAutostart: (enable) => rpc("setAutostart", { enable: !!enable }),
+    getRole: () => Promise.resolve("student"),
+    getSettings: () => Promise.resolve(null),
+    saveSettings: () => Promise.resolve(null),
+    importCourse: () => Promise.resolve(null),
+    exportCourse: () => Promise.resolve(null),
+    openLogDir: () => Promise.resolve(null),
+    getLogDir: () => Promise.resolve(null),
+    selectSubmissionDir: () => Promise.resolve(null),
+    minimizeWindow: () => send("minimizeWindow"),
+    maximizeWindow: () => send("maximizeWindow"),
+    closeWindow: () => send("closeWindow")
+  };
+  window.studentHost = api;
+  window.electronAPI = Object.assign({}, window.electronAPI || {}, api);
+})();
+)JS";
+}
+
+class StudentShellApp {
+ public:
+  StudentShellApp(HINSTANCE instance, bool adminMode)
+      : instance_(instance), adminMode_(adminMode), config_(lumesync::LoadConfig()) {
+    forceFullscreen_ = config_.forceFullscreen;
+    g_app = this;
+  }
+
+  ~StudentShellApp() {
+    g_app = nullptr;
+  }
+
+  bool Initialize(int nCmdShow) {
+    const wchar_t* className = adminMode_ ? kAdminWindowClassName : kMainWindowClassName;
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = instance_;
+    wc.lpfnWndProc = &StudentShellApp::WndProc;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    appIcon_ = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_LUMESYNC_STUDENT));
+    if (!appIcon_) {
+      appIcon_ = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    }
+    wc.hIcon = appIcon_;
+    wc.hIconSm = appIcon_;
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.lpszClassName = className;
+
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      return false;
+    }
+
+    const DWORD style = adminMode_ ? WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX : WS_OVERLAPPEDWINDOW;
+    const RECT windowRect = adminMode_ ? CenteredWindowRect(640, 720) : DefaultShellWindowRect();
+
+    hwnd_ = CreateWindowExW(
+        0,
+        className,
+        adminMode_ ? L"LumeSync Student Admin" : L"LumeSync Student",
+        style,
+        windowRect.left,
+        windowRect.top,
+        windowRect.right - windowRect.left,
+        windowRect.bottom - windowRect.top,
+        nullptr,
+        nullptr,
+        instance_,
+        this);
+
+    if (!hwnd_) {
+      return false;
+    }
+
+    if (adminMode_) {
+      CreateNativeAdminLogin();
+    } else {
+      CreateTrayIcon();
+      keyboardHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &StudentShellApp::KeyboardHookProc, instance_, 0);
+      SetTimer(hwnd_, kHeartbeatTimerId, 1000, nullptr);
+      SetTimer(hwnd_, kFocusTimerId, 750, nullptr);
+    }
+
+    ShowWindow(hwnd_, adminMode_ ? SW_SHOW : nCmdShow);
+    UpdateWindow(hwnd_);
+    if (!adminMode_) {
+      InitializeBrowser();
+    }
+    return true;
+  }
+
+  int Run() {
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    return static_cast<int>(msg.wParam);
+  }
+
+  bool IsClassActive() const {
+    return classActive_;
+  }
+
+ private:
+  static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    StudentShellApp* app = nullptr;
+    if (message == WM_NCCREATE) {
+      auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+      app = reinterpret_cast<StudentShellApp*>(create->lpCreateParams);
+      app->hwnd_ = hwnd;
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    } else {
+      app = reinterpret_cast<StudentShellApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    if (app) {
+      return app->HandleMessage(message, wParam, lParam);
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+  }
+
+  static LRESULT CALLBACK KeyboardHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code >= 0 && g_app && g_app->IsClassActive()) {
+      const auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+      const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+      if (keyDown) {
+        const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (key->vkCode == VK_LWIN || key->vkCode == VK_RWIN) return 1;
+        if (alt && (key->vkCode == VK_TAB || key->vkCode == VK_F4 || key->vkCode == VK_SPACE)) return 1;
+        if (ctrl && key->vkCode == VK_ESCAPE) return 1;
+      }
+    }
+
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+  }
+
+  LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+      case WM_SIZE:
+        if (!adminMode_) {
+          ResizeBrowser();
+        }
+        return 0;
+      case WM_TIMER:
+        OnTimer(wParam);
+        return 0;
+      case WM_CLOSE:
+        if (!adminMode_ && classActive_) {
+          ApplyClassMode();
+          return 0;
+        }
+        if (!adminMode_) {
+          ShowWindow(hwnd_, SW_HIDE);
+          return 0;
+        }
+        DestroyWindow(hwnd_);
+        return 0;
+      case WM_COMMAND:
+        if (adminMode_) {
+          OnAdminCommand(LOWORD(wParam));
+        } else {
+          OnCommand(LOWORD(wParam));
+        }
+        return 0;
+      case WM_PAINT:
+        if (adminMode_) {
+          DrawAdminChrome();
+          return 0;
+        }
+        break;
+      case WM_CTLCOLORSTATIC:
+        if (adminMode_) {
+          return AdminStaticColor(reinterpret_cast<HDC>(wParam));
+        }
+        break;
+      case WM_CTLCOLOREDIT:
+        if (adminMode_) {
+          return AdminEditColor(reinterpret_cast<HDC>(wParam));
+        }
+        break;
+      case WM_TRAY_ICON:
+        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+          ShowTrayMenu();
+        }
+        return 0;
+      case WM_DESTROY:
+        Shutdown();
+        if (adminMode_) {
+          PostQuitMessage(0);
+        }
+        return 0;
+      default:
+        return DefWindowProcW(hwnd_, message, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd_, message, wParam, lParam);
+  }
+
+  void InitializeBrowser() {
+#if LUMESYNC_HAS_WEBVIEW2
+    using CreateEnvironmentFn = HRESULT(STDAPICALLTYPE*)(
+        PCWSTR,
+        PCWSTR,
+        ICoreWebView2EnvironmentOptions*,
+        ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+
+    webviewLoader_ = LoadLibraryW(L"WebView2Loader.dll");
+    if (!webviewLoader_) {
+      lumesync::AppendLog(L"shell", L"WebView2Loader.dll is missing; cannot create WebView2 environment");
+      return;
+    }
+
+    auto* createEnvironment = reinterpret_cast<CreateEnvironmentFn>(
+        GetProcAddress(webviewLoader_, "CreateCoreWebView2EnvironmentWithOptions"));
+    if (!createEnvironment) {
+      lumesync::AppendLog(L"shell", L"WebView2Loader.dll does not export CreateCoreWebView2EnvironmentWithOptions");
+      return;
+    }
+
+    const auto dataFolder = (lumesync::ProgramDataDir() / L"webview2").wstring();
+    config_ = lumesync::LoadConfig();
+    auto options = Make<CoreWebView2EnvironmentOptions>();
+    const std::wstring browserArguments = BuildWebView2BrowserArguments(config_);
+    options->put_AdditionalBrowserArguments(browserArguments.c_str());
+    lumesync::AppendLog(L"shell", L"WebView2 browser arguments: " + browserArguments);
+
+    createEnvironment(
+        nullptr,
+        dataFolder.c_str(),
+        options.Get(),
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [this](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+              if (FAILED(result) || environment == nullptr) {
+                lumesync::AppendLog(L"shell", L"WebView2 environment creation failed");
+                return S_OK;
+              }
+
+              webviewEnvironment_ = environment;
+              return webviewEnvironment_->CreateCoreWebView2Controller(
+                  hwnd_,
+                  Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                      [this](HRESULT controllerResult, ICoreWebView2Controller* controller) -> HRESULT {
+                        if (FAILED(controllerResult) || controller == nullptr) {
+                          lumesync::AppendLog(L"shell", L"WebView2 controller creation failed");
+                          return S_OK;
+                        }
+
+                        webviewController_ = controller;
+                        webviewController_->get_CoreWebView2(&webview_);
+                        ResizeBrowser();
+                        RegisterBrowserEvents();
+                        return S_OK;
+                      })
+                      .Get());
+            })
+            .Get());
+#else
+    lumesync::AppendLog(L"shell", L"Built without WebView2 SDK; using fallback window");
+#endif
+  }
+
+  HWND CreateControl(
+      const wchar_t* className,
+      const wchar_t* text,
+      DWORD style,
+      int x,
+      int y,
+      int width,
+      int height,
+      UINT id,
+      DWORD exStyle = 0) {
+    HWND control = CreateWindowExW(
+        exStyle,
+        className,
+        text,
+        style | WS_CHILD,
+        x,
+        y,
+        width,
+        height,
+        hwnd_,
+        reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)),
+        instance_,
+        nullptr);
+    if (control) {
+      SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(adminFont_), TRUE);
+    }
+    return control;
+  }
+
+  void CreateNativeAdminLogin() {
+    adminBackgroundBrush_ = CreateSolidBrush(RGB(239, 244, 248));
+    adminCardBrush_ = CreateSolidBrush(RGB(255, 255, 255));
+    adminEditBrush_ = CreateSolidBrush(RGB(255, 255, 255));
+    adminFont_ = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    adminTitleFont_ = CreateFontW(-25, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    adminHintFont_ = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    const int left = 110;
+
+    adminTitle_ = CreateControl(L"STATIC", L"LumeSync 学生端管理", WS_VISIBLE | SS_CENTER, 80, 76, 480, 34, 0);
+    SendMessageW(adminTitle_, WM_SETFONT, reinterpret_cast<WPARAM>(adminTitleFont_), TRUE);
+    adminSubtitle_ = CreateControl(L"STATIC", L"验证管理员身份后可修改连接与启动设置", WS_VISIBLE | SS_CENTER, 90, 116, 460, 22, 0);
+    SendMessageW(adminSubtitle_, WM_SETFONT, reinterpret_cast<WPARAM>(adminHintFont_), TRUE);
+    adminLoginLabel_ = CreateControl(L"STATIC", L"管理员密码", WS_VISIBLE, left, 196, 420, 22, 0);
+    adminLoginPassword_ = CreateControl(
+        L"EDIT",
+        L"",
+        WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        left,
+        224,
+        420,
+        38,
+        kAdminLoginPassword,
+        WS_EX_CLIENTEDGE);
+    adminMessage_ = CreateControl(L"STATIC", L"", WS_VISIBLE | SS_CENTER, left, 278, 420, 24, 0);
+    SendMessageW(adminMessage_, WM_SETFONT, reinterpret_cast<WPARAM>(adminHintFont_), TRUE);
+    adminLoginButton_ = CreateControl(
+        L"BUTTON",
+        L"验证",
+        WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        left,
+        328,
+        420,
+        42,
+        kAdminLoginSubmit);
+
+    loginControls_ = {adminTitle_, adminSubtitle_, adminLoginLabel_, adminLoginPassword_, adminMessage_, adminLoginButton_};
+    CreateNativeAdminConfig();
+    ShowAdminConfig(false);
+    SetFocus(adminLoginPassword_);
+  }
+
+  void CreateNativeAdminConfig() {
+    const int left = 90;
+    const int labelWidth = 150;
+    const int inputLeft = 270;
+    const int inputWidth = 260;
+
+    configTitle_ = CreateControl(L"STATIC", L"系统配置", WS_VISIBLE | SS_CENTER, 80, 58, 480, 32, 0);
+    SendMessageW(configTitle_, WM_SETFONT, reinterpret_cast<WPARAM>(adminTitleFont_), TRUE);
+    adminIpLabel_ = CreateControl(L"STATIC", L"教师机 IP 地址", WS_VISIBLE, left, 124, labelWidth, 22, 0);
+    adminIpEdit_ = CreateControl(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, inputLeft, 120, inputWidth, 36, kAdminIp, WS_EX_CLIENTEDGE);
+    adminPortLabel_ = CreateControl(L"STATIC", L"端口号", WS_VISIBLE, left, 174, labelWidth, 22, 0);
+    adminPortEdit_ = CreateControl(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, inputLeft, 170, inputWidth, 36, kAdminPort, WS_EX_CLIENTEDGE);
+    adminAutostartCheck_ = CreateControl(L"BUTTON", L"开机自动启动", WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, left, 228, 260, 26, kAdminAutostart);
+    adminNewPasswordLabel_ = CreateControl(L"STATIC", L"新管理员密码", WS_VISIBLE, left, 292, labelWidth, 22, 0);
+    adminNewPasswordEdit_ = CreateControl(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL, inputLeft, 288, inputWidth, 36, kAdminNewPassword, WS_EX_CLIENTEDGE);
+    adminConfirmPasswordLabel_ = CreateControl(L"STATIC", L"确认新密码", WS_VISIBLE, left, 342, labelWidth, 22, 0);
+    adminConfirmPasswordEdit_ = CreateControl(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL, inputLeft, 338, inputWidth, 36, kAdminConfirmPassword, WS_EX_CLIENTEDGE);
+    adminConfigMessage_ = CreateControl(L"STATIC", L"", WS_VISIBLE | SS_CENTER, left, 394, 440, 24, 0);
+    SendMessageW(adminConfigMessage_, WM_SETFONT, reinterpret_cast<WPARAM>(adminHintFont_), TRUE);
+    adminSaveButton_ = CreateControl(L"BUTTON", L"保存设置", WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, left, 446, 440, 40, kAdminSave);
+    adminCloseButton_ = CreateControl(L"BUTTON", L"关闭窗口", WS_VISIBLE | WS_TABSTOP, left, 500, 214, 38, kAdminClose);
+    adminBackButton_ = CreateControl(L"BUTTON", L"返回验证", WS_VISIBLE | WS_TABSTOP, left + 226, 500, 214, 38, kAdminBack);
+
+    configControls_ = {
+        configTitle_,
+        adminIpLabel_,
+        adminIpEdit_,
+        adminPortLabel_,
+        adminPortEdit_,
+        adminAutostartCheck_,
+        adminNewPasswordLabel_,
+        adminNewPasswordEdit_,
+        adminConfirmPasswordLabel_,
+        adminConfirmPasswordEdit_,
+        adminConfigMessage_,
+        adminSaveButton_,
+        adminCloseButton_,
+        adminBackButton_};
+  }
+
+  void ShowAdminLogin(bool show) {
+    for (HWND control : loginControls_) {
+      if (control) ShowWindow(control, show ? SW_SHOW : SW_HIDE);
+    }
+    if (adminMode_) InvalidateRect(hwnd_, nullptr, TRUE);
+  }
+
+  void ShowAdminConfig(bool show) {
+    for (HWND control : configControls_) {
+      if (control) ShowWindow(control, show ? SW_SHOW : SW_HIDE);
+    }
+    if (adminMode_) InvalidateRect(hwnd_, nullptr, TRUE);
+  }
+
+  void DrawAdminChrome() {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd_, &ps);
+    RECT client;
+    GetClientRect(hwnd_, &client);
+
+    FillRect(hdc, &client, adminBackgroundBrush_);
+    RECT card = {32, 24, client.right - 32, client.bottom - 28};
+
+    HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, adminCardBrush_));
+    HPEN border = CreatePen(PS_SOLID, 1, RGB(218, 226, 236));
+    HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
+    RoundRect(hdc, card.left, card.top, card.right, card.bottom, 20, 20);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(border);
+
+    HBRUSH accent = CreateSolidBrush(RGB(37, 99, 235));
+    RECT accentRect = {card.left + 24, card.top + 20, card.left + 92, card.top + 24};
+    FillRect(hdc, &accentRect, accent);
+    DeleteObject(accent);
+
+    EndPaint(hwnd_, &ps);
+  }
+
+  LRESULT AdminStaticColor(HDC hdc) {
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(30, 41, 59));
+    return reinterpret_cast<LRESULT>(adminCardBrush_);
+  }
+
+  LRESULT AdminEditColor(HDC hdc) {
+    SetBkMode(hdc, OPAQUE);
+    SetBkColor(hdc, RGB(255, 255, 255));
+    SetTextColor(hdc, RGB(15, 23, 42));
+    return reinterpret_cast<LRESULT>(adminEditBrush_);
+  }
+
+  std::wstring ControlText(HWND control) {
+    if (!control) return L"";
+    const int length = GetWindowTextLengthW(control);
+    std::wstring text(static_cast<std::size_t>(length + 1), L'\0');
+    GetWindowTextW(control, text.data(), length + 1);
+    text.resize(static_cast<std::size_t>(length));
+    return text;
+  }
+
+  void SetControlText(HWND control, const std::wstring& text) {
+    if (control) {
+      SetWindowTextW(control, text.c_str());
+    }
+  }
+
+  bool VerifyAdminPassword(const std::wstring& password) {
+    config_ = lumesync::LoadConfig();
+    const std::wstring expected = config_.adminPasswordHash.empty() ? lumesync::DefaultAdminPasswordHash() : config_.adminPasswordHash;
+    return lumesync::Sha256Hex(password) == expected;
+  }
+
+  void LoadAdminConfigControls() {
+    config_ = lumesync::LoadConfig();
+    SetControlText(adminIpEdit_, config_.teacherIp);
+    SetControlText(adminPortEdit_, std::to_wstring(config_.port));
+    SendMessageW(adminAutostartCheck_, BM_SETCHECK, config_.autoStart ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetControlText(adminNewPasswordEdit_, L"");
+    SetControlText(adminConfirmPasswordEdit_, L"");
+    SetControlText(adminConfigMessage_, L"");
+  }
+
+  void OnAdminCommand(UINT command) {
+    if (command == kAdminLoginSubmit) {
+      const std::wstring password = ControlText(adminLoginPassword_);
+      if (password.empty()) {
+        SetControlText(adminMessage_, L"请输入管理员密码");
+        return;
+      }
+      if (!VerifyAdminPassword(password)) {
+        SetControlText(adminMessage_, L"密码错误");
+        SetControlText(adminLoginPassword_, L"");
+        SetFocus(adminLoginPassword_);
+        return;
+      }
+      SetControlText(adminMessage_, L"");
+      ShowAdminLogin(false);
+      LoadAdminConfigControls();
+      ShowAdminConfig(true);
+      SetFocus(adminIpEdit_);
+    } else if (command == kAdminSave) {
+      SaveAdminConfigFromControls();
+    } else if (command == kAdminClose) {
+      DestroyWindow(hwnd_);
+    } else if (command == kAdminBack) {
+      ShowAdminConfig(false);
+      ShowAdminLogin(true);
+      SetControlText(adminLoginPassword_, L"");
+      SetControlText(adminMessage_, L"");
+      SetFocus(adminLoginPassword_);
+    }
+  }
+
+  void SaveAdminConfigFromControls() {
+    std::wstring ip = ControlText(adminIpEdit_);
+    const std::wstring portText = ControlText(adminPortEdit_);
+    const std::wstring newPassword = ControlText(adminNewPasswordEdit_);
+    const std::wstring confirmPassword = ControlText(adminConfirmPasswordEdit_);
+
+    if (ip.empty()) {
+      SetControlText(adminConfigMessage_, L"请输入教师机 IP");
+      return;
+    }
+
+    int port = 3000;
+    try {
+      port = std::stoi(portText);
+    } catch (...) {
+      SetControlText(adminConfigMessage_, L"端口号无效");
+      return;
+    }
+
+    if (port <= 0 || port > 65535) {
+      SetControlText(adminConfigMessage_, L"端口号必须在 1 到 65535 之间");
+      return;
+    }
+
+    if (!newPassword.empty() && newPassword != confirmPassword) {
+      SetControlText(adminConfigMessage_, L"两次输入的新密码不一致");
+      return;
+    }
+
+    config_ = lumesync::LoadConfig();
+    config_.teacherIp = ip;
+    config_.port = port;
+    config_.autoStart = SendMessageW(adminAutostartCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!newPassword.empty()) {
+      config_.adminPasswordHash = lumesync::Sha256Hex(newPassword);
+    }
+
+    if (!lumesync::SaveConfig(config_)) {
+      SetControlText(adminConfigMessage_, L"保存失败，请检查权限");
+      return;
+    }
+
+    SetControlText(adminNewPasswordEdit_, L"");
+    SetControlText(adminConfirmPasswordEdit_, L"");
+    SetControlText(adminConfigMessage_, L"保存成功");
+  }
+
+  void RegisterBrowserEvents() {
+#if LUMESYNC_HAS_WEBVIEW2
+    if (!webview_) return;
+
+    const HRESULT scriptResult = webview_->AddScriptToExecuteOnDocumentCreated(
+        HostApiScript().c_str(),
+        Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
+            [this](HRESULT, LPCWSTR) -> HRESULT {
+              NavigateInitial();
+              return S_OK;
+            })
+            .Get());
+    if (FAILED(scriptResult)) {
+      NavigateInitial();
+    }
+
+    EventRegistrationToken token = {};
+    webview_->add_WebMessageReceived(
+        Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+            [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+              LPWSTR raw = nullptr;
+              if (SUCCEEDED(args->get_WebMessageAsJson(&raw)) && raw != nullptr) {
+                HandleWebMessage(raw);
+                CoTaskMemFree(raw);
+              }
+              return S_OK;
+            })
+            .Get(),
+        &token);
+
+    webview_->add_NavigationCompleted(
+        Callback<ICoreWebView2NavigationCompletedEventHandler>(
+            [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+              BOOL success = FALSE;
+              args->get_IsSuccess(&success);
+              if (!adminMode_ && !success && !offlinePageLoaded_) {
+                LoadOfflinePage();
+              } else if (!adminMode_ && success && !offlinePageLoaded_) {
+                KillTimer(hwnd_, kRetryTimerId);
+              }
+              return S_OK;
+            })
+            .Get(),
+        &token);
+
+    webview_->add_PermissionRequested(
+        Callback<ICoreWebView2PermissionRequestedEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2PermissionRequestedEventArgs* args) -> HRESULT {
+              args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+              return S_OK;
+            })
+            .Get(),
+        &token);
+#endif
+  }
+
+  void ResizeBrowser() {
+#if LUMESYNC_HAS_WEBVIEW2
+    if (!webviewController_) return;
+    RECT bounds;
+    GetClientRect(hwnd_, &bounds);
+    webviewController_->put_Bounds(bounds);
+#endif
+  }
+
+  void NavigateInitial() {
+    if (adminMode_) {
+      NavigateLocalPage(L"admin.html");
+      return;
+    }
+    NavigateTeacher();
+  }
+
+  void NavigateTeacher() {
+#if LUMESYNC_HAS_WEBVIEW2
+    if (!webview_) return;
+    config_ = lumesync::LoadConfig();
+    offlinePageLoaded_ = false;
+    webview_->Navigate(lumesync::BuildTeacherUrl(config_).c_str());
+#endif
+  }
+
+  void NavigateLocalPage(const std::wstring& fileName) {
+#if LUMESYNC_HAS_WEBVIEW2
+    if (!webview_) return;
+    const auto asset = FindUiAsset(fileName);
+    if (!asset) {
+      lumesync::AppendLog(L"shell", L"UI asset missing: " + fileName);
+      return;
+    }
+    webview_->Navigate(ToFileUrl(*asset).c_str());
+#endif
+  }
+
+  void LoadOfflinePage() {
+    offlinePageLoaded_ = true;
+    NavigateLocalPage(L"offline.html");
+    SetTimer(hwnd_, kRetryTimerId, 5000, nullptr);
+  }
+
+  void HandleWebMessage(const std::wstring& json) {
+    const auto action = lumesync::JsonStringField(json, L"action");
+    if (!action) return;
+
+    const auto kind = lumesync::JsonStringField(json, L"kind").value_or(L"event");
+    const auto id = lumesync::JsonStringField(json, L"id").value_or(L"");
+    const auto payload = lumesync::JsonObjectField(json, L"payload").value_or(L"{}");
+
+    if (kind == L"rpc") {
+      HandleRpc(id, *action, payload);
+    } else {
+      HandleEvent(*action, payload);
+    }
+  }
+
+  void HandleEvent(const std::wstring& action, const std::wstring& payload) {
+    if (action == L"classStarted") {
+      if (auto force = lumesync::JsonBoolField(payload, L"forceFullscreen")) {
+        forceFullscreen_ = *force;
+      }
+      classActive_ = true;
+      ApplyClassMode();
+      SaveRuntimeState();
+    } else if (action == L"classEnded") {
+      classActive_ = false;
+      RestoreNormalMode();
+      SaveRuntimeState();
+    } else if (action == L"setFullscreen") {
+      if (auto enable = lumesync::JsonBoolField(payload, L"enable")) {
+        forceFullscreen_ = *enable;
+        if (classActive_) ApplyClassMode();
+        SaveRuntimeState();
+      }
+    } else if (action == L"manualRetry") {
+      NavigateTeacher();
+    } else if (action == L"toggleDevTools") {
+      OpenDevTools();
+    } else if (action == L"minimizeWindow") {
+      if (!classActive_) ShowWindow(hwnd_, SW_MINIMIZE);
+    } else if (action == L"closeWindow") {
+      if (!classActive_) ShowWindow(hwnd_, SW_HIDE);
+    } else if (action == L"setAdminPassword") {
+      if (auto hash = lumesync::JsonStringField(payload, L"hash"); hash && !hash->empty()) {
+        config_ = lumesync::LoadConfig();
+        config_.adminPasswordHash = *hash;
+        lumesync::SaveConfig(config_);
+      }
+    }
+  }
+
+  void HandleRpc(const std::wstring& id, const std::wstring& action, const std::wstring& payload) {
+    if (action == L"getConfig") {
+      config_ = lumesync::LoadConfig();
+      std::wostringstream response;
+      response << L"{\"teacherIp\":\"" << lumesync::JsonEscape(config_.teacherIp)
+               << L"\",\"port\":" << config_.port
+               << L",\"forceFullscreen\":" << (config_.forceFullscreen ? L"true" : L"false")
+               << L",\"autoStart\":" << (config_.autoStart ? L"true" : L"false")
+               << L",\"guardEnabled\":" << (config_.guardEnabled ? L"true" : L"false") << L"}";
+      SendRpcResult(id, true, response.str());
+    } else if (action == L"saveConfig") {
+      if (lumesync::JsonBoolField(payload, L"_quit").value_or(false)) {
+        if (!classActive_) PostQuitMessage(0);
+        SendRpcResult(id, true, L"true");
+        return;
+      }
+
+      config_ = lumesync::LoadConfig();
+      if (auto value = lumesync::JsonStringField(payload, L"teacherIp"); value && !value->empty()) config_.teacherIp = *value;
+      if (auto value = lumesync::JsonIntField(payload, L"port")) config_.port = *value;
+      if (auto value = lumesync::JsonStringField(payload, L"adminPasswordHash"); value && !value->empty()) config_.adminPasswordHash = *value;
+      if (auto value = lumesync::JsonBoolField(payload, L"forceFullscreen")) config_.forceFullscreen = *value;
+      if (auto value = lumesync::JsonBoolField(payload, L"guardEnabled")) config_.guardEnabled = *value;
+
+      forceFullscreen_ = config_.forceFullscreen;
+      const bool saved = lumesync::SaveConfig(config_);
+      if (!adminMode_ && saved) NavigateTeacher();
+      SendRpcResult(id, saved, saved ? L"true" : L"false");
+    } else if (action == L"verifyPassword") {
+      config_ = lumesync::LoadConfig();
+      const std::wstring password = lumesync::JsonStringField(payload, L"password").value_or(L"");
+      const bool ok = lumesync::Sha256Hex(password) == (config_.adminPasswordHash.empty() ? lumesync::DefaultAdminPasswordHash() : config_.adminPasswordHash);
+      SendRpcResult(id, true, ok ? L"{\"ok\":true}" : L"{\"ok\":false}");
+    } else if (action == L"getAutostart") {
+      config_ = lumesync::LoadConfig();
+      SendRpcResult(id, true, config_.autoStart ? L"true" : L"false");
+    } else if (action == L"setAutostart") {
+      config_ = lumesync::LoadConfig();
+      config_.autoStart = lumesync::JsonBoolField(payload, L"enable").value_or(config_.autoStart);
+      const bool saved = lumesync::SaveConfig(config_);
+      SendRpcResult(id, saved, saved ? L"{\"success\":true}" : L"{\"success\":false,\"error\":\"save failed\"}");
+    } else if (action == L"getRole") {
+      SendRpcResult(id, true, L"\"student\"");
+    } else {
+      SendRpcResult(id, false, L"null", L"unknown action");
+    }
+  }
+
+  void SendRpcResult(const std::wstring& id, bool ok, const std::wstring& payloadJson, const std::wstring& error = L"") {
+#if LUMESYNC_HAS_WEBVIEW2
+    if (!webview_ || id.empty()) return;
+    std::wostringstream response;
+    response << L"{\"kind\":\"rpc-result\",\"id\":\"" << lumesync::JsonEscape(id)
+             << L"\",\"ok\":" << (ok ? L"true" : L"false")
+             << L",\"payload\":" << payloadJson;
+    if (!error.empty()) {
+      response << L",\"error\":\"" << lumesync::JsonEscape(error) << L"\"";
+    }
+    response << L"}";
+    webview_->PostWebMessageAsJson(response.str().c_str());
+#endif
+  }
+
+  void ApplyClassMode() {
+    if (!hwnd_) return;
+    ShowWindow(hwnd_, SW_SHOW);
+    if (!forceFullscreen_) {
+      SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+      SetForegroundWindow(hwnd_);
+      return;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = { sizeof(info) };
+    GetMonitorInfoW(monitor, &info);
+
+    SetWindowLongPtrW(hwnd_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    SetWindowPos(
+        hwnd_,
+        HWND_TOPMOST,
+        info.rcMonitor.left,
+        info.rcMonitor.top,
+        info.rcMonitor.right - info.rcMonitor.left,
+        info.rcMonitor.bottom - info.rcMonitor.top,
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    ShowTaskbar(false);
+    SetForegroundWindow(hwnd_);
+  }
+
+  void RestoreNormalMode() {
+    if (!hwnd_) return;
+    ShowTaskbar(true);
+    SetWindowLongPtrW(hwnd_, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+    const RECT windowRect = DefaultShellWindowRect();
+    SetWindowPos(
+        hwnd_,
+        HWND_NOTOPMOST,
+        windowRect.left,
+        windowRect.top,
+        windowRect.right - windowRect.left,
+        windowRect.bottom - windowRect.top,
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    SetForegroundWindow(hwnd_);
+  }
+
+  void SaveRuntimeState() {
+    lumesync::StudentState state;
+    state.classActive = classActive_;
+    state.forceFullscreen = forceFullscreen_;
+    state.heartbeatUtcMs = lumesync::UnixTimeMs();
+    state.shellPid = GetCurrentProcessId();
+    lumesync::SaveState(state);
+  }
+
+  void OnTimer(WPARAM timerId) {
+    if (timerId == kRetryTimerId) {
+      NavigateTeacher();
+    } else if (timerId == kHeartbeatTimerId) {
+      SaveRuntimeState();
+    } else if (timerId == kFocusTimerId && classActive_ && forceFullscreen_) {
+      if (GetForegroundWindow() != hwnd_) {
+        ShowWindow(hwnd_, SW_SHOW);
+        SetForegroundWindow(hwnd_);
+      }
+    }
+  }
+
+  void CreateTrayIcon() {
+    tray_ = {};
+    tray_.cbSize = sizeof(tray_);
+    tray_.hWnd = hwnd_;
+    tray_.uID = 1;
+    tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    tray_.uCallbackMessage = WM_TRAY_ICON;
+    tray_.hIcon = appIcon_ ? appIcon_ : LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    wcscpy_s(tray_.szTip, L"LumeSync Student");
+    Shell_NotifyIconW(NIM_ADD, &tray_);
+  }
+
+  void ShowTrayMenu() {
+    POINT cursor;
+    GetCursorPos(&cursor);
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, kTrayShow, L"Show Window");
+    AppendMenuW(menu, MF_STRING, kTrayAdmin, L"Admin Settings...");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (classActive_ ? MF_GRAYED : 0), kTrayExit, L"Exit");
+
+    SetForegroundWindow(hwnd_);
+    TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, cursor.x, cursor.y, 0, hwnd_, nullptr);
+    DestroyMenu(menu);
+  }
+
+  void OnCommand(UINT command) {
+    if (command == kTrayShow) {
+      ShowWindow(hwnd_, SW_SHOW);
+      SetForegroundWindow(hwnd_);
+    } else if (command == kTrayAdmin) {
+      LaunchAdminWindow();
+    } else if (command == kTrayExit && !classActive_) {
+      DestroyWindow(hwnd_);
+      PostQuitMessage(0);
+    }
+  }
+
+  void LaunchAdminWindow() {
+    const std::wstring command = QuotePath(ExePath()) + L" --admin-window";
+    STARTUPINFOW startup = { sizeof(startup) };
+    PROCESS_INFORMATION process = {};
+    std::wstring mutableCommand = command;
+    if (CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process)) {
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+  }
+
+  void OpenDevTools() {
+#if LUMESYNC_HAS_WEBVIEW2
+    if (webview_) {
+      webview_->OpenDevToolsWindow();
+    }
+#endif
+  }
+
+  void Shutdown() {
+    Shell_NotifyIconW(NIM_DELETE, &tray_);
+    if (keyboardHook_) {
+      UnhookWindowsHookEx(keyboardHook_);
+      keyboardHook_ = nullptr;
+    }
+    if (!adminMode_) {
+      ShowTaskbar(true);
+    }
+#if LUMESYNC_HAS_WEBVIEW2
+    if (webviewLoader_) {
+      FreeLibrary(webviewLoader_);
+      webviewLoader_ = nullptr;
+    }
+#endif
+    if (adminFont_) DeleteObject(adminFont_);
+    if (adminTitleFont_) DeleteObject(adminTitleFont_);
+    if (adminHintFont_) DeleteObject(adminHintFont_);
+    if (adminBackgroundBrush_) DeleteObject(adminBackgroundBrush_);
+    if (adminCardBrush_) DeleteObject(adminCardBrush_);
+    if (adminEditBrush_) DeleteObject(adminEditBrush_);
+  }
+
+  HINSTANCE instance_ = nullptr;
+  HWND hwnd_ = nullptr;
+  bool adminMode_ = false;
+  bool classActive_ = false;
+  bool forceFullscreen_ = true;
+  bool offlinePageLoaded_ = false;
+  HHOOK keyboardHook_ = nullptr;
+  HICON appIcon_ = nullptr;
+  HFONT adminFont_ = nullptr;
+  HFONT adminTitleFont_ = nullptr;
+  HFONT adminHintFont_ = nullptr;
+  HBRUSH adminBackgroundBrush_ = nullptr;
+  HBRUSH adminCardBrush_ = nullptr;
+  HBRUSH adminEditBrush_ = nullptr;
+  HWND adminTitle_ = nullptr;
+  HWND adminSubtitle_ = nullptr;
+  HWND adminLoginLabel_ = nullptr;
+  HWND adminLoginPassword_ = nullptr;
+  HWND adminMessage_ = nullptr;
+  HWND adminLoginButton_ = nullptr;
+  HWND configTitle_ = nullptr;
+  HWND adminIpLabel_ = nullptr;
+  HWND adminIpEdit_ = nullptr;
+  HWND adminPortLabel_ = nullptr;
+  HWND adminPortEdit_ = nullptr;
+  HWND adminAutostartCheck_ = nullptr;
+  HWND adminNewPasswordLabel_ = nullptr;
+  HWND adminNewPasswordEdit_ = nullptr;
+  HWND adminConfirmPasswordLabel_ = nullptr;
+  HWND adminConfirmPasswordEdit_ = nullptr;
+  HWND adminConfigMessage_ = nullptr;
+  HWND adminSaveButton_ = nullptr;
+  HWND adminCloseButton_ = nullptr;
+  HWND adminBackButton_ = nullptr;
+  std::vector<HWND> loginControls_;
+  std::vector<HWND> configControls_;
+  NOTIFYICONDATAW tray_ = {};
+  lumesync::StudentConfig config_;
+
+#if LUMESYNC_HAS_WEBVIEW2
+  HMODULE webviewLoader_ = nullptr;
+  ComPtr<ICoreWebView2Environment> webviewEnvironment_;
+  ComPtr<ICoreWebView2Controller> webviewController_;
+  ComPtr<ICoreWebView2> webview_;
+#endif
+};
+
+}  // namespace
+
+int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int nCmdShow) {
+  EnableDpiAwareness();
+  lumesync::EnsureRuntimeDirectories();
+  lumesync::AppendLog(L"shell", L"Student shell starting");
+
+  const bool adminMode = HasArg(L"--admin-window");
+  HANDLE instanceMutex = AcquireInstanceMutex(adminMode);
+  if (!instanceMutex) {
+    lumesync::AppendLog(L"shell", adminMode ? L"Admin instance already running" : L"Main instance already running");
+    ActivateExistingInstance(adminMode);
+    return 0;
+  }
+
+  StudentShellApp app(instance, adminMode);
+  if (!app.Initialize(nCmdShow)) {
+    lumesync::AppendLog(L"shell", L"Failed to initialize shell window");
+    ReleaseMutex(instanceMutex);
+    CloseHandle(instanceMutex);
+    return 1;
+  }
+
+  const int result = app.Run();
+  ReleaseMutex(instanceMutex);
+  CloseHandle(instanceMutex);
+  return result;
+}
