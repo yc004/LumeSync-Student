@@ -2,6 +2,9 @@
 dist/
 out/
 build/
+!shared/build/
+shared/build/*
+!shared/build/icon-student.ico
 *.log
 .DS_Store
 Thumbs.db
