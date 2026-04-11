@@ -11,6 +11,7 @@ target_link_libraries(LumeSyncStudentShell
     shell32
     ole32
     advapi32
+    winhttp
 )
 
 if(WEBVIEW2_INCLUDE_DIR)

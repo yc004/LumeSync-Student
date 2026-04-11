@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 
 #include <algorithm>
 #include <filesystem>
@@ -7,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstring>
 
 #include "lumesync/shared.h"
 #include "resource.h"
@@ -186,6 +189,108 @@ void ShowTaskbar(bool show) {
   }
 }
 
+struct BootstrapSessionResult {
+  bool ok = false;
+  std::wstring token;
+  std::wstring expiresAt;
+  std::wstring serverTime;
+  std::wstring error;
+};
+
+std::wstring WinHttpReadAll(HINTERNET request) {
+  std::string body;
+  DWORD available = 0;
+  do {
+    available = 0;
+    if (!WinHttpQueryDataAvailable(request, &available)) {
+      return L"";
+    }
+    if (available == 0) {
+      break;
+    }
+    std::string chunk(available, '\0');
+    DWORD read = 0;
+    if (!WinHttpReadData(request, chunk.data(), available, &read)) {
+      return L"";
+    }
+    chunk.resize(read);
+    body += chunk;
+  } while (available > 0);
+  return lumesync::Utf8Decode(body);
+}
+
+BootstrapSessionResult BootstrapViewerSession(const lumesync::StudentConfig& config) {
+  BootstrapSessionResult result;
+  HINTERNET session = WinHttpOpen(L"LumeSyncStudent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!session) {
+    result.error = L"WinHttpOpen failed";
+    return result;
+  }
+
+  HINTERNET connect = WinHttpConnect(session, config.teacherIp.c_str(), static_cast<INTERNET_PORT>(config.port), 0);
+  if (!connect) {
+    result.error = L"WinHttpConnect failed";
+    WinHttpCloseHandle(session);
+    return result;
+  }
+
+  HINTERNET request = WinHttpOpenRequest(connect, L"POST", L"/api/session/bootstrap", nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+  if (!request) {
+    result.error = L"WinHttpOpenRequest failed";
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return result;
+  }
+
+  const std::wstring payload = L"{\"role\":\"viewer\",\"clientId\":\"" + lumesync::JsonEscape(config.clientId) + L"\"}";
+  const std::wstring headers = L"Content-Type: application/json\r\n";
+  const std::string payloadUtf8 = lumesync::Utf8Encode(payload);
+  const BOOL sent = WinHttpSendRequest(
+      request,
+      headers.c_str(),
+      static_cast<DWORD>(headers.size()),
+      payloadUtf8.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(payloadUtf8.data()),
+      static_cast<DWORD>(payloadUtf8.size()),
+      static_cast<DWORD>(payloadUtf8.size()),
+      0);
+  if (!sent || !WinHttpReceiveResponse(request, nullptr)) {
+    result.error = L"bootstrap request failed";
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return result;
+  }
+
+  DWORD statusCode = 0;
+  DWORD statusSize = sizeof(statusCode);
+  WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+  const std::wstring response = WinHttpReadAll(request);
+
+  WinHttpCloseHandle(request);
+  WinHttpCloseHandle(connect);
+  WinHttpCloseHandle(session);
+
+  if (statusCode < 200 || statusCode >= 300) {
+    result.error = lumesync::JsonStringField(response, L"error").value_or(L"bootstrap http error");
+    return result;
+  }
+
+  const bool success = lumesync::JsonBoolField(response, L"success").value_or(false);
+  const std::wstring role = lumesync::JsonStringField(response, L"role").value_or(L"");
+  const std::wstring clientId = lumesync::JsonStringField(response, L"clientId").value_or(L"");
+  result.token = lumesync::JsonStringField(response, L"token").value_or(L"");
+  result.expiresAt = lumesync::JsonStringField(response, L"expiresAt").value_or(L"");
+  result.serverTime = lumesync::JsonStringField(response, L"serverTime").value_or(L"");
+
+  if (!success || role != L"viewer" || clientId != config.clientId || result.token.empty()) {
+    result.error = L"bootstrap payload invalid";
+    return result;
+  }
+
+  result.ok = true;
+  return result;
+}
+
 std::wstring HostApiScript() {
   return LR"JS(
 (() => {
@@ -255,7 +360,9 @@ std::wstring HostApiScript() {
     verifyPassword: (password) => rpc("verifyPassword", { password }),
     getAutostart: () => rpc("getAutostart"),
     setAutostart: (enable) => rpc("setAutostart", { enable: !!enable }),
-    getRole: () => Promise.resolve("student"),
+    getRole: () => Promise.resolve("viewer"),
+    getSession: () => rpc("getSession"),
+    bootstrapSession: () => rpc("bootstrapSession"),
     getSettings: () => Promise.resolve(null),
     saveSettings: () => Promise.resolve(null),
     importCourse: () => Promise.resolve(null),
@@ -861,10 +968,60 @@ class StudentShellApp {
     NavigateTeacher();
   }
 
+  bool BootstrapSession() {
+    config_ = lumesync::LoadConfig();
+    const bool hadClientId = !config_.clientId.empty();
+    lumesync::EnsureClientId(config_);
+    if (!hadClientId) {
+      lumesync::SaveConfig(config_);
+    }
+
+    const BootstrapSessionResult result = BootstrapViewerSession(config_);
+    if (!result.ok) {
+      config_.sessionToken.clear();
+      config_.sessionExpiresAt.clear();
+      config_.sessionServerTime.clear();
+      lumesync::SaveConfig(config_);
+      lumesync::AppendLog(L"shell", L"Session bootstrap failed: " + result.error);
+      return false;
+    }
+
+    config_.sessionToken = result.token;
+    config_.sessionExpiresAt = result.expiresAt;
+    config_.sessionServerTime = result.serverTime;
+    lumesync::SaveConfig(config_);
+    lumesync::AppendLog(L"shell", L"Session bootstrap succeeded for clientId=" + config_.clientId);
+    return true;
+  }
+
+  std::wstring SessionPayloadJson() {
+    config_ = lumesync::LoadConfig();
+    if (config_.clientId.empty() || config_.sessionToken.empty()) {
+      return L"null";
+    }
+
+    std::wostringstream json;
+    json << L"{"
+         << L"\"role\":\"viewer\","
+         << L"\"clientId\":\"" << lumesync::JsonEscape(config_.clientId) << L"\","
+         << L"\"token\":\"" << lumesync::JsonEscape(config_.sessionToken) << L"\"";
+    if (!config_.sessionExpiresAt.empty()) {
+      json << L",\"expiresAt\":\"" << lumesync::JsonEscape(config_.sessionExpiresAt) << L"\"";
+    }
+    if (!config_.sessionServerTime.empty()) {
+      json << L",\"serverTime\":\"" << lumesync::JsonEscape(config_.sessionServerTime) << L"\"";
+    }
+    json << L"}";
+    return json.str();
+  }
+
   void NavigateTeacher() {
 #if LUMESYNC_HAS_WEBVIEW2
     if (!webview_) return;
-    config_ = lumesync::LoadConfig();
+    if (!BootstrapSession()) {
+      LoadOfflinePage();
+      return;
+    }
     offlinePageLoaded_ = false;
     webview_->Navigate(lumesync::BuildTeacherUrl(config_).c_str());
 #endif
@@ -946,7 +1103,12 @@ class StudentShellApp {
                << L"\",\"port\":" << config_.port
                << L",\"forceFullscreen\":" << (config_.forceFullscreen ? L"true" : L"false")
                << L",\"autoStart\":" << (config_.autoStart ? L"true" : L"false")
-               << L",\"guardEnabled\":" << (config_.guardEnabled ? L"true" : L"false") << L"}";
+               << L",\"guardEnabled\":" << (config_.guardEnabled ? L"true" : L"false")
+               << L",\"clientId\":\"" << lumesync::JsonEscape(config_.clientId) << L"\""
+               << L",\"sessionToken\":\"" << lumesync::JsonEscape(config_.sessionToken) << L"\""
+               << L",\"sessionExpiresAt\":\"" << lumesync::JsonEscape(config_.sessionExpiresAt) << L"\""
+               << L",\"sessionServerTime\":\"" << lumesync::JsonEscape(config_.sessionServerTime) << L"\""
+               << L"}";
       SendRpcResult(id, true, response.str());
     } else if (action == L"saveConfig") {
       if (lumesync::JsonBoolField(payload, L"_quit").value_or(false)) {
@@ -961,6 +1123,7 @@ class StudentShellApp {
       if (auto value = lumesync::JsonStringField(payload, L"adminPasswordHash"); value && !value->empty()) config_.adminPasswordHash = *value;
       if (auto value = lumesync::JsonBoolField(payload, L"forceFullscreen")) config_.forceFullscreen = *value;
       if (auto value = lumesync::JsonBoolField(payload, L"guardEnabled")) config_.guardEnabled = *value;
+      lumesync::EnsureClientId(config_);
 
       forceFullscreen_ = config_.forceFullscreen;
       const bool saved = lumesync::SaveConfig(config_);
@@ -980,7 +1143,12 @@ class StudentShellApp {
       const bool saved = lumesync::SaveConfig(config_);
       SendRpcResult(id, saved, saved ? L"{\"success\":true}" : L"{\"success\":false,\"error\":\"save failed\"}");
     } else if (action == L"getRole") {
-      SendRpcResult(id, true, L"\"student\"");
+      SendRpcResult(id, true, L"\"viewer\"");
+    } else if (action == L"getSession") {
+      SendRpcResult(id, true, SessionPayloadJson());
+    } else if (action == L"bootstrapSession") {
+      const bool ok = BootstrapSession();
+      SendRpcResult(id, ok, ok ? SessionPayloadJson() : L"null", ok ? L"" : L"bootstrap failed");
     } else {
       SendRpcResult(id, false, L"null", L"unknown action");
     }

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <fstream>
 #include <iomanip>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <vector>
@@ -84,6 +85,20 @@ std::wstring BoolText(bool value) {
   return value ? L"true" : L"false";
 }
 
+std::wstring RandomHex(std::size_t length) {
+  static constexpr wchar_t kHex[] = L"0123456789abcdef";
+  std::random_device device;
+  std::mt19937 generator(device());
+  std::uniform_int_distribution<int> distribution(0, 15);
+
+  std::wstring value;
+  value.reserve(length);
+  for (std::size_t index = 0; index < length; ++index) {
+    value.push_back(kHex[distribution(generator)]);
+  }
+  return value;
+}
+
 }  // namespace
 
 std::wstring DefaultAdminPasswordHash() {
@@ -130,6 +145,10 @@ StudentConfig LoadConfig() {
   if (auto value = JsonBoolField(raw, L"forceFullscreen")) config.forceFullscreen = *value;
   if (auto value = JsonBoolField(raw, L"autoStart")) config.autoStart = *value;
   if (auto value = JsonBoolField(raw, L"guardEnabled")) config.guardEnabled = *value;
+  if (auto value = JsonStringField(raw, L"clientId")) config.clientId = *value;
+  if (auto value = JsonStringField(raw, L"sessionToken")) config.sessionToken = *value;
+  if (auto value = JsonStringField(raw, L"sessionExpiresAt")) config.sessionExpiresAt = *value;
+  if (auto value = JsonStringField(raw, L"sessionServerTime")) config.sessionServerTime = *value;
 
   if (config.port <= 0 || config.port > 65535) {
     config.port = 3000;
@@ -150,7 +169,11 @@ bool SaveConfig(const StudentConfig& config) {
        << L"  \"adminPasswordHash\": \"" << JsonEscape(config.adminPasswordHash.empty() ? DefaultAdminPasswordHash() : config.adminPasswordHash) << L"\",\n"
        << L"  \"forceFullscreen\": " << BoolText(config.forceFullscreen) << L",\n"
        << L"  \"autoStart\": " << BoolText(config.autoStart) << L",\n"
-       << L"  \"guardEnabled\": " << BoolText(config.guardEnabled) << L"\n"
+       << L"  \"guardEnabled\": " << BoolText(config.guardEnabled) << L",\n"
+       << L"  \"clientId\": \"" << JsonEscape(config.clientId) << L"\",\n"
+       << L"  \"sessionToken\": \"" << JsonEscape(config.sessionToken) << L"\",\n"
+       << L"  \"sessionExpiresAt\": \"" << JsonEscape(config.sessionExpiresAt) << L"\",\n"
+       << L"  \"sessionServerTime\": \"" << JsonEscape(config.sessionServerTime) << L"\"\n"
        << L"}\n";
 
   return WriteTextFile(ConfigPath(), json.str());
@@ -193,6 +216,18 @@ std::wstring BuildTeacherUrl(const StudentConfig& config) {
   std::wostringstream url;
   url << L"http://" << config.teacherIp << L":" << config.port;
   return url.str();
+}
+
+std::wstring BuildSessionBootstrapUrl(const StudentConfig& config) {
+  return BuildTeacherUrl(config) + L"/api/session/bootstrap";
+}
+
+std::wstring EnsureClientId(StudentConfig& config) {
+  if (!config.clientId.empty()) {
+    return config.clientId;
+  }
+  config.clientId = L"student-" + RandomHex(24);
+  return config.clientId;
 }
 
 std::wstring Sha256Hex(const std::wstring& input) {

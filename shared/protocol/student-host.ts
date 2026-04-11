@@ -5,6 +5,10 @@ export interface StudentConfig {
   forceFullscreen: boolean;
   autoStart: boolean;
   guardEnabled: boolean;
+  clientId?: string;
+  sessionToken?: string;
+  sessionExpiresAt?: string;
+  sessionServerTime?: string;
 }
 
 export interface VerifyPasswordResult {
@@ -20,6 +24,14 @@ export interface ClassStartOptions {
   forceFullscreen?: boolean;
 }
 
+export interface StudentSession {
+  role: "viewer";
+  clientId: string;
+  token: string;
+  expiresAt?: string;
+  serverTime?: string;
+}
+
 export interface StudentHostApi {
   classStarted(options?: ClassStartOptions): void;
   classEnded(): void;
@@ -31,7 +43,9 @@ export interface StudentHostApi {
   setAutostart(enable: boolean): Promise<SaveAutostartResult>;
   manualRetry(): void;
   setAdminPassword(hash: string): void;
-  getRole(): Promise<"student">;
+  getRole(): Promise<"viewer">;
+  getSession(): Promise<StudentSession | null>;
+  bootstrapSession(): Promise<StudentSession | null>;
   toggleDevTools(): void;
 }
 

@@ -14,6 +14,10 @@ struct StudentConfig {
   bool forceFullscreen = true;
   bool autoStart = true;
   bool guardEnabled = true;
+  std::wstring clientId;
+  std::wstring sessionToken;
+  std::wstring sessionExpiresAt;
+  std::wstring sessionServerTime;
 };
 
 struct StudentState {
@@ -36,6 +40,8 @@ StudentState LoadState();
 bool SaveState(const StudentState& state);
 
 std::wstring BuildTeacherUrl(const StudentConfig& config);
+std::wstring BuildSessionBootstrapUrl(const StudentConfig& config);
+std::wstring EnsureClientId(StudentConfig& config);
 std::wstring Sha256Hex(const std::wstring& input);
 std::uint64_t UnixTimeMs();
 void AppendLog(const std::wstring& component, const std::wstring& message);

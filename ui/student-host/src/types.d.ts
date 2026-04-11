@@ -5,6 +5,10 @@ export interface StudentConfig {
   forceFullscreen: boolean;
   autoStart: boolean;
   guardEnabled: boolean;
+  clientId?: string;
+  sessionToken?: string;
+  sessionExpiresAt?: string;
+  sessionServerTime?: string;
 }
 
 export interface VerifyPasswordResult {
@@ -16,6 +20,14 @@ export interface SaveAutostartResult {
   error?: string;
 }
 
+export interface StudentSession {
+  role: "viewer";
+  clientId: string;
+  token: string;
+  expiresAt?: string;
+  serverTime?: string;
+}
+
 export interface StudentHostApi {
   getConfig(): Promise<StudentConfig>;
   saveConfig(config: Partial<StudentConfig> & { _quit?: boolean }): Promise<boolean>;
@@ -23,5 +35,7 @@ export interface StudentHostApi {
   getAutostart(): Promise<boolean>;
   setAutostart(enable: boolean): Promise<SaveAutostartResult>;
   manualRetry(): void;
+  getSession(): Promise<StudentSession | null>;
+  bootstrapSession(): Promise<StudentSession | null>;
   toggleDevTools(): void;
 }
