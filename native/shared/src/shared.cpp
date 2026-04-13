@@ -214,12 +214,14 @@ bool SaveState(const StudentState& state) {
 
 std::wstring BuildTeacherUrl(const StudentConfig& config) {
   std::wostringstream url;
-  url << L"http://" << config.teacherIp << L":" << config.port;
+  url << L"http://" << config.teacherIp << L":" << config.port << L"/student.html";
   return url.str();
 }
 
 std::wstring BuildSessionBootstrapUrl(const StudentConfig& config) {
-  return BuildTeacherUrl(config) + L"/api/session/bootstrap";
+  std::wostringstream url;
+  url << L"http://" << config.teacherIp << L":" << config.port << L"/api/session/bootstrap";
+  return url.str();
 }
 
 std::wstring EnsureClientId(StudentConfig& config) {
