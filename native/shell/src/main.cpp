@@ -1,6 +1,10 @@
+#define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
 #include <winhttp.h>
+#include <wincrypt.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #pragma comment(lib, "winhttp.lib")
 
 #include <algorithm>
@@ -10,6 +14,10 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cmath>
+#include <thread>
+#include <atomic>
+#include <memory>
 
 #include "lumesync/shared.h"
 #include "resource.h"
@@ -26,9 +34,245 @@ using Microsoft::WRL::Make;
 #define LUMESYNC_HAS_WEBVIEW2 0
 #endif
 
+using namespace Gdiplus;
+
 namespace {
 
+struct GdiplusScope {
+  ULONG_PTR token = 0;
+
+  GdiplusScope() {
+    GdiplusStartupInput input;
+    const Status status = GdiplusStartup(&token, &input, nullptr);
+    if (status != Ok) {
+      token = 0;
+      lumesync::AppendLog(L"shell", L"GDI+ startup failed");
+    }
+  }
+
+  ~GdiplusScope() {
+    if (token != 0) {
+      GdiplusShutdown(token);
+    }
+  }
+
+  bool Ready() const { return token != 0; }
+};
+
+std::optional<std::wstring> Base64Encode(const BYTE* data, DWORD size) {
+  if (!data || size == 0) return std::nullopt;
+  DWORD required = 0;
+  if (!CryptBinaryToStringW(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &required)) {
+    return std::nullopt;
+  }
+  std::wstring encoded(required, L'\0');
+  if (!CryptBinaryToStringW(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, encoded.data(), &required)) {
+    return std::nullopt;
+  }
+  if (!encoded.empty() && encoded.back() == L'\0') encoded.pop_back();
+  return encoded;
+}
+
+std::optional<CLSID> FindEncoderClsid(const WCHAR* mimeType) {
+  UINT num = 0;
+  UINT size = 0;
+  if (GetImageEncodersSize(&num, &size) != Ok || size == 0) {
+    return std::nullopt;
+  }
+  std::vector<BYTE> buffer(size);
+  auto* info = reinterpret_cast<ImageCodecInfo*>(buffer.data());
+  if (GetImageEncoders(num, size, info) != Ok) {
+    return std::nullopt;
+  }
+  for (UINT i = 0; i < num; ++i) {
+    if (info[i].MimeType && wcscmp(info[i].MimeType, mimeType) == 0) {
+      return info[i].Clsid;
+    }
+  }
+  return std::nullopt;
+}
+
+std::wstring BuildScreenshotPayloadJson(const std::wstring& dataUrl, int width, int height) {
+  std::wostringstream json;
+  json << L"{"
+       << L"\"dataUrl\":\"" << lumesync::JsonEscape(dataUrl) << L"\","
+       << L"\"width\":" << width << L","
+       << L"\"height\":" << height << L","
+       << L"\"capturedAt\":\"" << lumesync::JsonEscape(std::to_wstring(lumesync::UnixTimeMs())) << L"\""
+       << L"}";
+  return json.str();
+}
+
+std::wstring BuildInlineOfflineHtml(const lumesync::StudentConfig& config) {
+  std::wostringstream html;
+  html << LR"HTML(<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>无法连接教师端</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif; background: linear-gradient(180deg, #0f172a, #020617); color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { width: min(560px, calc(100vw - 48px)); padding: 36px 32px; border-radius: 24px; background: rgba(15,23,42,0.88); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 24px 80px rgba(0,0,0,0.38); }
+    .badge { display:inline-flex; align-items:center; gap:10px; margin-bottom:18px; font-size:12px; font-weight:700; letter-spacing:.18em; color:#93c5fd; text-transform:uppercase; }
+    .dot { width:10px; height:10px; border-radius:999px; background:#f59e0b; box-shadow:0 0 0 8px rgba(245,158,11,.14); }
+    h1 { font-size: 28px; font-weight: 800; color: #f8fafc; margin-bottom: 12px; }
+    p { line-height: 1.75; color: #94a3b8; font-size: 14px; }
+    .url { margin-top: 16px; padding: 14px 16px; border-radius: 16px; background: rgba(2,6,23,0.55); border: 1px solid rgba(255,255,255,0.08); color: #bfdbfe; font-family: Consolas, monospace; word-break: break-all; }
+    .actions { margin-top: 22px; display: flex; gap: 12px; flex-wrap: wrap; }
+    button { border: none; border-radius: 14px; padding: 12px 18px; cursor: pointer; font-weight: 700; }
+    .primary { background: #2563eb; color: #fff; }
+    .ghost { background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.1); }
+    .tips { margin-top: 18px; font-size: 12px; color: #64748b; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge"><span class="dot"></span> LumeSync Student</div>
+    <h1>无法连接到教师端</h1>
+    <p>学生端已启动，但当前无法连接教师端服务。请检查教师机地址、端口以及局域网连通性。</p>
+    <div class="url">)HTML";
+  html << L"http://" << lumesync::JsonEscape(config.teacherIp) << L":" << config.port;
+  html << LR"HTML(</div>
+    <div class="actions">
+      <button class="primary" onclick="window.studentHost?.manualRetry?.()">立即重试</button>
+      <button class="ghost" onclick="window.studentHost?.toggleDevTools?.()">打开调试面板</button>
+    </div>
+    <div class="tips">如果这是本机联调，请把教师机地址改为 127.0.0.1；如需修改配置，请使用独立管理员窗口启动参数 <code>--admin-window</code>。</div>
+  </div>
+</body>
+</html>)HTML";
+  return html.str();
+}
+
+void NavigateInlineHtml(ICoreWebView2* webview, const std::wstring& html) {
+#if LUMESYNC_HAS_WEBVIEW2
+  if (!webview) return;
+  webview->NavigateToString(html.c_str());
+#else
+  (void)webview;
+  (void)html;
+#endif
+}
+
+
+std::optional<std::wstring> CaptureScreenAsJpegDataUrl(int maxWidth, int quality) {
+  const int targetMaxWidth = std::max(160, std::min(maxWidth > 0 ? maxWidth : 320, 1280));
+  const int jpegQuality = std::max(30, std::min(quality > 0 ? quality : 70, 95));
+
+  const int screenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int screenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  if (screenWidth <= 0 || screenHeight <= 0) {
+    return std::nullopt;
+  }
+
+  const int scaledWidth = std::min(targetMaxWidth, screenWidth);
+  const int scaledHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(screenHeight) * scaledWidth / screenWidth)));
+
+  HDC screenDc = GetDC(nullptr);
+  if (!screenDc) return std::nullopt;
+
+  HDC sourceDc = CreateCompatibleDC(screenDc);
+  HDC scaledDc = CreateCompatibleDC(screenDc);
+  HBITMAP sourceBitmap = CreateCompatibleBitmap(screenDc, screenWidth, screenHeight);
+  HBITMAP scaledBitmap = CreateCompatibleBitmap(screenDc, scaledWidth, scaledHeight);
+
+  if (!sourceDc || !scaledDc || !sourceBitmap || !scaledBitmap) {
+    if (sourceBitmap) DeleteObject(sourceBitmap);
+    if (scaledBitmap) DeleteObject(scaledBitmap);
+    if (sourceDc) DeleteDC(sourceDc);
+    if (scaledDc) DeleteDC(scaledDc);
+    ReleaseDC(nullptr, screenDc);
+    return std::nullopt;
+  }
+
+  HGDIOBJ oldSource = SelectObject(sourceDc, sourceBitmap);
+  HGDIOBJ oldScaled = SelectObject(scaledDc, scaledBitmap);
+
+  bool ok = BitBlt(sourceDc, 0, 0, screenWidth, screenHeight, screenDc, screenX, screenY, SRCCOPY | CAPTUREBLT) != FALSE;
+  if (ok) {
+    SetStretchBltMode(scaledDc, HALFTONE);
+    SetBrushOrgEx(scaledDc, 0, 0, nullptr);
+    ok = StretchBlt(scaledDc, 0, 0, scaledWidth, scaledHeight, sourceDc, 0, 0, screenWidth, screenHeight, SRCCOPY) != FALSE;
+  }
+
+  SelectObject(sourceDc, oldSource);
+  SelectObject(scaledDc, oldScaled);
+  DeleteDC(sourceDc);
+  DeleteDC(scaledDc);
+  ReleaseDC(nullptr, screenDc);
+  DeleteObject(sourceBitmap);
+
+  if (!ok) {
+    DeleteObject(scaledBitmap);
+    return std::nullopt;
+  }
+
+  auto jpegClsid = FindEncoderClsid(L"image/jpeg");
+  if (!jpegClsid) {
+    DeleteObject(scaledBitmap);
+    return std::nullopt;
+  }
+
+  Bitmap bitmap(scaledBitmap, nullptr);
+
+  ComPtr<IStream> stream;
+  if (CreateStreamOnHGlobal(nullptr, TRUE, &stream) != S_OK || !stream) {
+    DeleteObject(scaledBitmap);
+    return std::nullopt;
+  }
+
+  EncoderParameters encoderParams{};
+  encoderParams.Count = 1;
+  encoderParams.Parameter[0].Guid = EncoderQuality;
+  encoderParams.Parameter[0].Type = EncoderParameterValueTypeLong;
+  encoderParams.Parameter[0].NumberOfValues = 1;
+  ULONG qualityValue = static_cast<ULONG>(jpegQuality);
+  encoderParams.Parameter[0].Value = &qualityValue;
+
+  if (bitmap.Save(stream.Get(), &(*jpegClsid), &encoderParams) != Ok) {
+    DeleteObject(scaledBitmap);
+    return std::nullopt;
+  }
+  DeleteObject(scaledBitmap);
+
+
+  STATSTG stats{};
+  if (stream->Stat(&stats, STATFLAG_NONAME) != S_OK || stats.cbSize.QuadPart <= 0) {
+    return std::nullopt;
+  }
+
+  LARGE_INTEGER seekTo{};
+  stream->Seek(seekTo, STREAM_SEEK_SET, nullptr);
+  std::vector<BYTE> bytes(static_cast<size_t>(stats.cbSize.QuadPart));
+  ULONG bytesRead = 0;
+  if (stream->Read(bytes.data(), static_cast<ULONG>(bytes.size()), &bytesRead) != S_OK || bytesRead == 0) {
+    return std::nullopt;
+  }
+  bytes.resize(bytesRead);
+
+  auto encoded = Base64Encode(bytes.data(), static_cast<DWORD>(bytes.size()));
+  if (!encoded) {
+    return std::nullopt;
+  }
+
+  return L"data:image/jpeg;base64," + *encoded;
+}
+
+class StudentShellApp;
+StudentShellApp* g_app = nullptr;
+constexpr wchar_t kMainWindowClassName[] = L"LumeSyncStudentShellWindow";
+constexpr wchar_t kAdminWindowClassName[] = L"LumeSyncStudentAdminWindow";
+constexpr wchar_t kMainInstanceMutex[] = L"Global\\LumeSyncStudentShell.Main";
+constexpr wchar_t kAdminInstanceMutex[] = L"Global\\LumeSyncStudentShell.Admin";
+
+const GdiplusScope g_gdiplusScope;
+
 constexpr UINT WM_TRAY_ICON = WM_APP + 40;
+constexpr UINT WM_BOOTSTRAP_RESULT = WM_APP + 41;
 constexpr UINT_PTR kRetryTimerId = 1;
 constexpr UINT_PTR kHeartbeatTimerId = 2;
 constexpr UINT_PTR kFocusTimerId = 3;
@@ -45,13 +289,6 @@ constexpr UINT kAdminConfirmPassword = 2014;
 constexpr UINT kAdminSave = 2015;
 constexpr UINT kAdminClose = 2016;
 constexpr UINT kAdminBack = 2017;
-
-class StudentShellApp;
-StudentShellApp* g_app = nullptr;
-constexpr wchar_t kMainWindowClassName[] = L"LumeSyncStudentShellWindow";
-constexpr wchar_t kAdminWindowClassName[] = L"LumeSyncStudentAdminWindow";
-constexpr wchar_t kMainInstanceMutex[] = L"Global\\LumeSyncStudentShell.Main";
-constexpr wchar_t kAdminInstanceMutex[] = L"Global\\LumeSyncStudentShell.Admin";
 
 std::filesystem::path ExePath() {
   std::wstring buffer(MAX_PATH, L'\0');
@@ -135,8 +372,8 @@ RECT CenteredWindowRect(int width, int height) {
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
   const int availableWidth = workArea.right - workArea.left;
   const int availableHeight = workArea.bottom - workArea.top;
-  const int x = workArea.left + max(0, (availableWidth - width) / 2);
-  const int y = workArea.top + max(0, (availableHeight - height) / 2);
+  const int x = workArea.left + std::max(0, (availableWidth - width) / 2);
+  const int y = workArea.top + std::max(0, (availableHeight - height) / 2);
   return RECT{x, y, x + width, y + height};
 }
 
@@ -145,8 +382,8 @@ RECT DefaultShellWindowRect() {
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
   const int availableWidth = workArea.right - workArea.left;
   const int availableHeight = workArea.bottom - workArea.top;
-  const int width = min(max(1440, availableWidth * 85 / 100), availableWidth);
-  const int height = min(max(900, availableHeight * 85 / 100), availableHeight);
+  const int width = std::min(std::max(1440, availableWidth * 85 / 100), availableWidth);
+  const int height = std::min(std::max(900, availableHeight * 85 / 100), availableHeight);
   return CenteredWindowRect(width, height);
 }
 
@@ -165,6 +402,27 @@ std::optional<std::filesystem::path> FindUiAsset(const std::wstring& fileName) {
   }
 
   return std::nullopt;
+}
+
+bool TryNavigateLocalPage(ICoreWebView2* webview, const std::wstring& fileName) {
+#if LUMESYNC_HAS_WEBVIEW2
+  if (!webview) {
+    lumesync::AppendLog(L"shell", L"TryNavigateLocalPage called without WebView: " + fileName);
+    return false;
+  }
+  const auto asset = FindUiAsset(fileName);
+  if (!asset) {
+    lumesync::AppendLog(L"shell", L"UI asset missing: " + fileName);
+    return false;
+  }
+  lumesync::AppendLog(L"shell", L"Navigating local page: " + asset->wstring());
+  webview->Navigate(ToFileUrl(*asset).c_str());
+  return true;
+#else
+  (void)webview;
+  (void)fileName;
+  return false;
+#endif
 }
 
 std::wstring BuildWebView2BrowserArguments(const lumesync::StudentConfig& config) {
@@ -197,6 +455,14 @@ struct BootstrapSessionResult {
   std::wstring error;
 };
 
+struct BootstrapUiResult {
+  bool ok = false;
+  std::wstring error;
+  std::wstring token;
+  std::wstring expiresAt;
+  std::wstring serverTime;
+};
+
 std::wstring WinHttpReadAll(HINTERNET request) {
   std::string body;
   DWORD available = 0;
@@ -221,15 +487,18 @@ std::wstring WinHttpReadAll(HINTERNET request) {
 
 BootstrapSessionResult BootstrapViewerSession(const lumesync::StudentConfig& config) {
   BootstrapSessionResult result;
+  lumesync::AppendLog(L"shell", L"BootstrapViewerSession start teacher=" + config.teacherIp + L":" + std::to_wstring(config.port) + L" clientId=" + config.clientId);
   HINTERNET session = WinHttpOpen(L"LumeSyncStudent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) {
     result.error = L"WinHttpOpen failed";
+    lumesync::AppendLog(L"shell", L"BootstrapViewerSession error: WinHttpOpen failed");
     return result;
   }
 
   HINTERNET connect = WinHttpConnect(session, config.teacherIp.c_str(), static_cast<INTERNET_PORT>(config.port), 0);
   if (!connect) {
     result.error = L"WinHttpConnect failed";
+    lumesync::AppendLog(L"shell", L"BootstrapViewerSession error: WinHttpConnect failed");
     WinHttpCloseHandle(session);
     return result;
   }
@@ -237,6 +506,7 @@ BootstrapSessionResult BootstrapViewerSession(const lumesync::StudentConfig& con
   HINTERNET request = WinHttpOpenRequest(connect, L"POST", L"/api/session/bootstrap", nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
   if (!request) {
     result.error = L"WinHttpOpenRequest failed";
+    lumesync::AppendLog(L"shell", L"BootstrapViewerSession error: WinHttpOpenRequest failed");
     WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);
     return result;
@@ -255,6 +525,7 @@ BootstrapSessionResult BootstrapViewerSession(const lumesync::StudentConfig& con
       0);
   if (!sent || !WinHttpReceiveResponse(request, nullptr)) {
     result.error = L"bootstrap request failed";
+    lumesync::AppendLog(L"shell", L"BootstrapViewerSession error: bootstrap request failed");
     WinHttpCloseHandle(request);
     WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);
@@ -355,6 +626,7 @@ std::wstring HostApiScript() {
     manualRetry: () => send("manualRetry"),
     setAdminPassword: (hash) => send("setAdminPassword", { hash }),
     toggleDevTools: () => send("toggleDevTools"),
+    takeScreenshot: (options) => rpc("takeScreenshot", options || {}),
     getConfig: () => rpc("getConfig"),
     saveConfig: (config) => rpc("saveConfig", config || {}),
     verifyPassword: (password) => rpc("verifyPassword", { password }),
@@ -393,6 +665,7 @@ class StudentShellApp {
   }
 
   bool Initialize(int nCmdShow) {
+    lumesync::AppendLog(L"shell", adminMode_ ? L"Initialize admin window" : L"Initialize main window");
     const wchar_t* className = adminMode_ ? kAdminWindowClassName : kMainWindowClassName;
 
     WNDCLASSEXW wc = {};
@@ -548,6 +821,11 @@ class StudentShellApp {
           ShowTrayMenu();
         }
         return 0;
+      case WM_BOOTSTRAP_RESULT: {
+        std::unique_ptr<BootstrapUiResult> result(reinterpret_cast<BootstrapUiResult*>(lParam));
+        ApplyBootstrapResult(std::move(result));
+        return 0;
+      }
       case WM_DESTROY:
         Shutdown();
         if (adminMode_) {
@@ -562,6 +840,7 @@ class StudentShellApp {
 
   void InitializeBrowser() {
 #if LUMESYNC_HAS_WEBVIEW2
+    lumesync::AppendLog(L"shell", L"InitializeBrowser start");
     using CreateEnvironmentFn = HRESULT(STDAPICALLTYPE*)(
         PCWSTR,
         PCWSTR,
@@ -965,7 +1244,61 @@ class StudentShellApp {
       NavigateLocalPage(L"admin.html");
       return;
     }
-    NavigateTeacher();
+    LoadOfflinePage();
+    StartBootstrapAsync();
+  }
+
+  void StartBootstrapAsync() {
+    if (bootstrapInFlight_.exchange(true)) {
+      lumesync::AppendLog(L"shell", L"StartBootstrapAsync skipped: bootstrap already in flight");
+      return;
+    }
+    config_ = lumesync::LoadConfig();
+    const bool hadClientId = !config_.clientId.empty();
+    lumesync::EnsureClientId(config_);
+    if (!hadClientId) {
+      lumesync::SaveConfig(config_);
+    }
+    const auto configCopy = config_;
+    const HWND targetHwnd = hwnd_;
+    lumesync::AppendLog(L"shell", L"StartBootstrapAsync queued for teacher=" + configCopy.teacherIp + L":" + std::to_wstring(configCopy.port));
+    std::thread([targetHwnd, configCopy]() {
+      auto* uiResult = new BootstrapUiResult();
+      const BootstrapSessionResult result = BootstrapViewerSession(configCopy);
+      uiResult->ok = result.ok;
+      uiResult->error = result.error;
+      uiResult->token = result.token;
+      uiResult->expiresAt = result.expiresAt;
+      uiResult->serverTime = result.serverTime;
+      PostMessageW(targetHwnd, WM_BOOTSTRAP_RESULT, 0, reinterpret_cast<LPARAM>(uiResult));
+    }).detach();
+  }
+
+  void ApplyBootstrapResult(std::unique_ptr<BootstrapUiResult> result) {
+    bootstrapInFlight_ = false;
+    config_ = lumesync::LoadConfig();
+    if (!result || !result->ok) {
+      config_.sessionToken.clear();
+      config_.sessionExpiresAt.clear();
+      config_.sessionServerTime.clear();
+      lumesync::SaveConfig(config_);
+      lumesync::AppendLog(L"shell", L"Session bootstrap failed: " + (result ? result->error : L"unknown error"));
+      LoadOfflinePage();
+      return;
+    }
+    config_.sessionToken = result->token;
+    config_.sessionExpiresAt = result->expiresAt;
+    config_.sessionServerTime = result->serverTime;
+    lumesync::SaveConfig(config_);
+    offlinePageLoaded_ = false;
+    lumesync::AppendLog(L"shell", L"Session bootstrap succeeded for clientId=" + config_.clientId);
+    lumesync::AppendLog(L"shell", L"ApplyBootstrapResult navigating to teacher page");
+#if LUMESYNC_HAS_WEBVIEW2
+    if (webview_) {
+      KillTimer(hwnd_, kRetryTimerId);
+      webview_->Navigate(lumesync::BuildTeacherUrl(config_).c_str());
+    }
+#endif
   }
 
   bool BootstrapSession() {
@@ -1017,31 +1350,37 @@ class StudentShellApp {
 
   void NavigateTeacher() {
 #if LUMESYNC_HAS_WEBVIEW2
-    if (!webview_) return;
-    if (!BootstrapSession()) {
-      LoadOfflinePage();
+    if (!webview_) {
+      lumesync::AppendLog(L"shell", L"NavigateTeacher skipped: webview not ready");
       return;
     }
-    offlinePageLoaded_ = false;
-    webview_->Navigate(lumesync::BuildTeacherUrl(config_).c_str());
+    config_ = lumesync::LoadConfig();
+    lumesync::AppendLog(L"shell", L"NavigateTeacher target=" + lumesync::BuildTeacherUrl(config_));
+    StartBootstrapAsync();
 #endif
   }
 
   void NavigateLocalPage(const std::wstring& fileName) {
 #if LUMESYNC_HAS_WEBVIEW2
     if (!webview_) return;
-    const auto asset = FindUiAsset(fileName);
-    if (!asset) {
-      lumesync::AppendLog(L"shell", L"UI asset missing: " + fileName);
-      return;
-    }
-    webview_->Navigate(ToFileUrl(*asset).c_str());
+    TryNavigateLocalPage(webview_.Get(), fileName);
 #endif
   }
 
   void LoadOfflinePage() {
     offlinePageLoaded_ = true;
-    NavigateLocalPage(L"offline.html");
+    lumesync::AppendLog(L"shell", L"LoadOfflinePage start");
+#if LUMESYNC_HAS_WEBVIEW2
+    if (webview_) {
+      if (!TryNavigateLocalPage(webview_.Get(), L"offline.html")) {
+        config_ = lumesync::LoadConfig();
+        lumesync::AppendLog(L"shell", L"LoadOfflinePage fallback to inline HTML for teacher=" + config_.teacherIp + L":" + std::to_wstring(config_.port));
+        NavigateInlineHtml(webview_.Get(), BuildInlineOfflineHtml(config_));
+      }
+    } else {
+      lumesync::AppendLog(L"shell", L"LoadOfflinePage skipped local navigation: webview not ready");
+    }
+#endif
     SetTimer(hwnd_, kRetryTimerId, 5000, nullptr);
   }
 
@@ -1079,7 +1418,7 @@ class StudentShellApp {
         SaveRuntimeState();
       }
     } else if (action == L"manualRetry") {
-      NavigateTeacher();
+      StartBootstrapAsync();
     } else if (action == L"toggleDevTools") {
       OpenDevTools();
     } else if (action == L"minimizeWindow") {
@@ -1149,6 +1488,23 @@ class StudentShellApp {
     } else if (action == L"bootstrapSession") {
       const bool ok = BootstrapSession();
       SendRpcResult(id, ok, ok ? SessionPayloadJson() : L"null", ok ? L"" : L"bootstrap failed");
+    } else if (action == L"takeScreenshot") {
+      if (!g_gdiplusScope.Ready()) {
+        SendRpcResult(id, false, L"null", L"gdiplus unavailable");
+        return;
+      }
+      const int maxWidth = lumesync::JsonIntField(payload, L"maxWidth").value_or(320);
+      const int quality = lumesync::JsonIntField(payload, L"quality").value_or(70);
+      auto dataUrl = CaptureScreenAsJpegDataUrl(maxWidth, quality);
+      if (!dataUrl) {
+        SendRpcResult(id, false, L"null", L"capture failed");
+        return;
+      }
+      const int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+      const int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+      const int finalWidth = std::min(std::max(160, maxWidth > 0 ? maxWidth : 320), std::max(1, screenWidth));
+      const int finalHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(screenHeight) * finalWidth / std::max(1, screenWidth))));
+      SendRpcResult(id, true, BuildScreenshotPayloadJson(*dataUrl, finalWidth, finalHeight));
     } else {
       SendRpcResult(id, false, L"null", L"unknown action");
     }
@@ -1222,7 +1578,7 @@ class StudentShellApp {
 
   void OnTimer(WPARAM timerId) {
     if (timerId == kRetryTimerId) {
-      NavigateTeacher();
+      StartBootstrapAsync();
     } else if (timerId == kHeartbeatTimerId) {
       SaveRuntimeState();
     } else if (timerId == kFocusTimerId && classActive_ && forceFullscreen_) {
@@ -1319,6 +1675,7 @@ class StudentShellApp {
   bool classActive_ = false;
   bool forceFullscreen_ = true;
   bool offlinePageLoaded_ = false;
+  std::atomic<bool> bootstrapInFlight_{false};
   HHOOK keyboardHook_ = nullptr;
   HICON appIcon_ = nullptr;
   HFONT adminFont_ = nullptr;

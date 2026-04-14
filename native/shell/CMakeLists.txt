@@ -11,6 +11,9 @@ target_link_libraries(LumeSyncStudentShell
     shell32
     ole32
     advapi32
+    crypt32
+    gdiplus
+    oleaut32
     winhttp
 )
 
