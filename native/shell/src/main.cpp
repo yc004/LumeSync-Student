@@ -737,6 +737,10 @@ class StudentShellApp {
     return classActive_;
   }
 
+  bool IsFullscreenLocked() const {
+    return classActive_ && forceFullscreen_;
+  }
+
  private:
   static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     StudentShellApp* app = nullptr;
@@ -757,7 +761,7 @@ class StudentShellApp {
   }
 
   static LRESULT CALLBACK KeyboardHookProc(int code, WPARAM wParam, LPARAM lParam) {
-    if (code >= 0 && g_app && g_app->IsClassActive()) {
+    if (code >= 0 && g_app && g_app->IsFullscreenLocked()) {
       const auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
       const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
       if (keyDown) {
@@ -1178,6 +1182,11 @@ class StudentShellApp {
 #if LUMESYNC_HAS_WEBVIEW2
     if (!webview_) return;
 
+    ComPtr<ICoreWebView2Settings> webviewSettings;
+    if (SUCCEEDED(webview_->get_Settings(&webviewSettings)) && webviewSettings) {
+      webviewSettings->put_AreDefaultContextMenusEnabled(FALSE);
+    }
+
     const HRESULT scriptResult = webview_->AddScriptToExecuteOnDocumentCreated(
         HostApiScript().c_str(),
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
@@ -1529,7 +1538,18 @@ class StudentShellApp {
     if (!hwnd_) return;
     ShowWindow(hwnd_, SW_SHOW);
     if (!forceFullscreen_) {
-      SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+      // Fullscreen can be disabled while class is active; restore normal shell window.
+      ShowTaskbar(true);
+      SetWindowLongPtrW(hwnd_, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+      const RECT windowRect = DefaultShellWindowRect();
+      SetWindowPos(
+          hwnd_,
+          HWND_NOTOPMOST,
+          windowRect.left,
+          windowRect.top,
+          windowRect.right - windowRect.left,
+          windowRect.bottom - windowRect.top,
+          SWP_FRAMECHANGED | SWP_SHOWWINDOW);
       SetForegroundWindow(hwnd_);
       return;
     }
