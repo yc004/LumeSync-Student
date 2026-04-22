@@ -20,6 +20,17 @@ export interface SaveAutostartResult {
   error?: string;
 }
 
+export interface PowerControlResult {
+  success: boolean;
+  error?: string;
+}
+
+export interface StudentDeviceInfo {
+  mac?: string;
+  deviceName?: string;
+  clientId?: string;
+}
+
 export interface ClassStartOptions {
   forceFullscreen?: boolean;
 }
@@ -43,6 +54,8 @@ export interface StudentHostApi {
   setAutostart(enable: boolean): Promise<SaveAutostartResult>;
   manualRetry(): void;
   setAdminPassword(hash: string): void;
+  powerControl(payload: { action: "shutdown" | "restart" | "force-shutdown" | "force-restart"; requestId?: string }): Promise<PowerControlResult>;
+  getDeviceInfo(): Promise<StudentDeviceInfo>;
   getRole(): Promise<"viewer">;
   getSession(): Promise<StudentSession | null>;
   bootstrapSession(): Promise<StudentSession | null>;

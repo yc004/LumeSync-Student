@@ -1,16 +1,21 @@
 #define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <winhttp.h>
 #include <wincrypt.h>
+#include <iphlpapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 #include <algorithm>
 #include <filesystem>
 #include <optional>
 #include <sstream>
+#include <iomanip>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -99,6 +104,57 @@ std::wstring BuildScreenshotPayloadJson(const std::wstring& dataUrl, int width, 
        << L"\"width\":" << width << L","
        << L"\"height\":" << height << L","
        << L"\"capturedAt\":\"" << lumesync::JsonEscape(std::to_wstring(lumesync::UnixTimeMs())) << L"\""
+       << L"}";
+  return json.str();
+}
+
+std::wstring FormatMacAddress(const BYTE* address, ULONG length) {
+  if (!address || length != 6) return L"";
+  std::wostringstream mac;
+  mac << std::hex << std::setfill(L'0');
+  for (ULONG i = 0; i < length; ++i) {
+    if (i > 0) mac << L":";
+    mac << std::setw(2) << static_cast<int>(address[i]);
+  }
+  return mac.str();
+}
+
+std::wstring GetPrimaryMacAddress() {
+  ULONG bufferSize = 15 * 1024;
+  std::vector<BYTE> buffer(bufferSize);
+  IP_ADAPTER_ADDRESSES* addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+  ULONG result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, addresses, &bufferSize);
+  if (result == ERROR_BUFFER_OVERFLOW) {
+    buffer.resize(bufferSize);
+    addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    result = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, addresses, &bufferSize);
+  }
+  if (result != NO_ERROR) return L"";
+
+  std::wstring fallback;
+  for (IP_ADAPTER_ADDRESSES* adapter = addresses; adapter; adapter = adapter->Next) {
+    const bool isUsableType = adapter->IfType == IF_TYPE_ETHERNET_CSMACD || adapter->IfType == IF_TYPE_IEEE80211;
+    if (!isUsableType || adapter->PhysicalAddressLength != 6) continue;
+    const std::wstring mac = FormatMacAddress(adapter->PhysicalAddress, adapter->PhysicalAddressLength);
+    if (mac.empty()) continue;
+    if (fallback.empty()) fallback = mac;
+    if (adapter->OperStatus == IfOperStatusUp) return mac;
+  }
+  return fallback;
+}
+
+std::wstring BuildDeviceInfoPayloadJson(const lumesync::StudentConfig& config) {
+  wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1] = {};
+  DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+  std::wstring deviceName;
+  if (GetComputerNameW(computerName, &size) && size > 0) {
+    deviceName.assign(computerName, size);
+  }
+  std::wostringstream json;
+  json << L"{"
+       << L"\"mac\":\"" << lumesync::JsonEscape(GetPrimaryMacAddress()) << L"\","
+       << L"\"deviceName\":\"" << lumesync::JsonEscape(deviceName) << L"\","
+       << L"\"clientId\":\"" << lumesync::JsonEscape(config.clientId) << L"\""
        << L"}";
   return json.str();
 }
@@ -625,6 +681,7 @@ std::wstring HostApiScript() {
     setFullscreen: (enable) => send("setFullscreen", { enable: !!enable }),
     manualRetry: () => send("manualRetry"),
     setAdminPassword: (hash) => send("setAdminPassword", { hash }),
+    powerControl: (payload) => rpc("powerControl", payload || {}),
     toggleDevTools: () => send("toggleDevTools"),
     takeScreenshot: (options) => rpc("takeScreenshot", options || {}),
     getConfig: () => rpc("getConfig"),
@@ -635,6 +692,7 @@ std::wstring HostApiScript() {
     getRole: () => Promise.resolve("viewer"),
     getSession: () => rpc("getSession"),
     bootstrapSession: () => rpc("bootstrapSession"),
+    getDeviceInfo: () => rpc("getDeviceInfo"),
     getSettings: () => Promise.resolve(null),
     saveSettings: () => Promise.resolve(null),
     importCourse: () => Promise.resolve(null),
@@ -1497,6 +1555,18 @@ class StudentShellApp {
     } else if (action == L"bootstrapSession") {
       const bool ok = BootstrapSession();
       SendRpcResult(id, ok, ok ? SessionPayloadJson() : L"null", ok ? L"" : L"bootstrap failed");
+    } else if (action == L"getDeviceInfo") {
+      config_ = lumesync::LoadConfig();
+      SendRpcResult(id, true, BuildDeviceInfoPayloadJson(config_));
+    } else if (action == L"powerControl") {
+      const std::wstring requestedAction = lumesync::JsonStringField(payload, L"action").value_or(L"");
+      std::wstring error;
+      const bool ok = ExecutePowerControl(requestedAction, error);
+      if (ok) {
+        SendRpcResult(id, true, L"{\"success\":true}");
+      } else {
+        SendRpcResult(id, false, L"{\"success\":false,\"error\":\"" + lumesync::JsonEscape(error) + L"\"}", error);
+      }
     } else if (action == L"takeScreenshot") {
       if (!g_gdiplusScope.Ready()) {
         SendRpcResult(id, false, L"null", L"gdiplus unavailable");
@@ -1656,6 +1726,45 @@ class StudentShellApp {
       CloseHandle(process.hThread);
       CloseHandle(process.hProcess);
     }
+  }
+
+  bool ExecutePowerControl(const std::wstring& action, std::wstring& error) {
+    std::wstring flag;
+    bool force = false;
+    if (action == L"shutdown") {
+      flag = L"/s";
+    } else if (action == L"restart") {
+      flag = L"/r";
+    } else if (action == L"force-shutdown") {
+      flag = L"/s";
+      force = true;
+    } else if (action == L"force-restart") {
+      flag = L"/r";
+      force = true;
+    } else {
+      error = L"unsupported action";
+      return false;
+    }
+
+    wchar_t systemDir[MAX_PATH] = {};
+    const UINT length = GetSystemDirectoryW(systemDir, MAX_PATH);
+    const std::wstring shutdownExe = (length > 0 && length < MAX_PATH)
+        ? (std::wstring(systemDir) + L"\\shutdown.exe")
+        : L"shutdown.exe";
+    std::wstring command = QuotePath(shutdownExe) + L" " + flag + (force ? L" /f" : L"") + L" /t 0";
+
+    STARTUPINFOW startup = { sizeof(startup) };
+    PROCESS_INFORMATION process = {};
+    std::wstring mutableCommand = command;
+    if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+      error = L"CreateProcess failed: " + std::to_wstring(GetLastError());
+      lumesync::AppendLog(L"shell", L"Power control failed action=" + action + L" error=" + error);
+      return false;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    lumesync::AppendLog(L"shell", L"Power control accepted action=" + action);
+    return true;
   }
 
   void OpenDevTools() {
